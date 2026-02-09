@@ -612,6 +612,7 @@ rpl_slave_state::record_gtid(THD *thd, const rpl_gtid *gtid, uint64 sub_id,
   TABLE_LIST tlist;
   int err= 0, not_sql_thread;
   bool table_opened= false;
+  BINLOG_STATE binlog_state_save;
   TABLE *table;
   ulonglong thd_saved_option= thd->variables.option_bits;
   Query_tables_list lex_backup;
@@ -717,11 +718,9 @@ rpl_slave_state::record_gtid(THD *thd, const rpl_gtid *gtid, uint64 sub_id,
   {
     DBUG_PRINT("info", ("resetting OPTION_BEGIN"));
     thd->variables.option_bits&=
-      ~(ulonglong)(OPTION_NOT_AUTOCOMMIT |OPTION_BEGIN |OPTION_BIN_LOG |
-                   OPTION_GTID_BEGIN);
+      ~(ulonglong)(OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_GTID_BEGIN);
   }
-  else
-    thd->variables.option_bits&= ~(ulonglong)OPTION_BIN_LOG;
+  thd->tmp_disable_binlog(&binlog_state_save, BINLOG_STATE_TMP_DISABLED);
 
   bitmap_set_all(table->write_set);
   table->rpl_write_set= table->write_set;
@@ -775,6 +774,7 @@ end:
 #endif
   thd->lex->restore_backup_query_tables_list(&lex_backup);
   thd->variables.option_bits= thd_saved_option;
+  thd->reenable_binlog(&binlog_state_save);
   thd->resume_subsequent_commits(suspended_wfc);
   DBUG_EXECUTE_IF("inject_record_gtid_serverid_100_sleep",
     {
@@ -880,7 +880,7 @@ rpl_slave_state::gtid_delete_pending(THD *thd,
                                      rpl_slave_state::list_element **list_ptr)
 {
   int err= 0;
-  ulonglong thd_saved_option;
+  BINLOG_STATE save;
 
   if (unlikely(!loaded))
     return;
@@ -889,10 +889,10 @@ rpl_slave_state::gtid_delete_pending(THD *thd,
   thd->wsrep_ignore_table= true; // No Galera replication for mysql.gtid_pos_table
 #endif
 
-  thd_saved_option= thd->variables.option_bits;
+  /* tmp_disable_binlog will also remember option_bits */
+  thd->tmp_disable_binlog(&save, BINLOG_STATE_TMP_DISABLED);
   thd->variables.option_bits&=
-    ~(ulonglong)(OPTION_NOT_AUTOCOMMIT |OPTION_BEGIN |OPTION_BIN_LOG |
-                 OPTION_GTID_BEGIN);
+    ~(ulonglong)(OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN | OPTION_GTID_BEGIN);
 
   while (*list_ptr)
   {
@@ -1028,7 +1028,7 @@ end:
     if (err)
       break;
   }
-  thd->variables.option_bits= thd_saved_option;
+  thd->reenable_binlog(&save);
 
 #ifdef WITH_WSREP
   thd->wsrep_ignore_table= false;
