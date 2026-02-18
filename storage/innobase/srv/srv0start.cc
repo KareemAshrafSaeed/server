@@ -266,14 +266,20 @@ close_and_exit:
 
 /** Rename the redo log file after resizing.
 @return whether an error occurred */
-bool log_t::resize_rename() noexcept
+ATTRIBUTE_COLD bool log_t::resize_rename() noexcept
 {
-  const std::string old_name{get_circular_path(101)};
+  return rename(get_circular_path(101));
+}
+
+/** Rename the redo log file after resizing.
+@return whether an error occurred */
+ATTRIBUTE_COLD bool log_t::rename(const std::string &old_name) noexcept
+{
   const std::string new_name{log_sys.get_path()};
 
   if (IF_WIN(MoveFileEx(old_name.c_str(), new_name.c_str(),
                         MOVEFILE_REPLACE_EXISTING),
-             !rename(old_name.c_str(), new_name.c_str())))
+             !::rename(old_name.c_str(), new_name.c_str())))
     return false;
 
   sql_print_error("InnoDB: Failed to rename log from %.*s to %.*s (error %d)",

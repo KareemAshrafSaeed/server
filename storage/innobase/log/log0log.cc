@@ -325,7 +325,8 @@ bool log_t::attach(log_file_t file, os_offset_t size,
                    log_t::log_access access) noexcept
 {
   ut_ad(file.is_opened());
-  ut_ad(!log.is_opened() || (archive && log.m_file == file.m_file));
+  ut_ad(!log.is_opened() ||
+        (log.m_file == file.m_file && (archive || recv_sys.was_archive)));
   ut_ad(archive || !resize_log.is_opened());
   ut_ad(archive || !buf);
   ut_ad(archive || !resize_buf);
@@ -483,11 +484,12 @@ void log_t::create(lsn_t lsn) noexcept
 #ifdef HAVE_PMEM
   if (is_mmap())
   {
+    ut_ad(is_mmap_writeable());
     ut_ad(is_opened() == archive);
     mprotect(buf, size_t(file_size), PROT_READ | PROT_WRITE);
     buf_size= unsigned(std::min<uint64_t>(capacity(), buf_size_max));
     if (archive)
-      goto archive_header;
+      goto create_archive_header;
     memset_aligned<4096>(buf, 0, 4096);
     header_write(buf, lsn, is_encrypted());
     pmem_persist(buf, 512);
@@ -506,7 +508,7 @@ void log_t::create(lsn_t lsn) noexcept
     }
     else
 #ifdef HAVE_PMEM
-    archive_header:
+    create_archive_header:
 #endif
       if (is_encrypted())
         log_crypt_write_header(buf);
@@ -1778,16 +1780,30 @@ ATTRIBUTE_COLD void log_write_and_flush_prepare() noexcept
 
 void log_t::clear_mmap() noexcept
 {
+  ut_ad(latch_have_wr());
+  ut_ad(is_mmap());
   ut_ad(!srv_read_only_mode || recv_sys.rpo);
 
-  if (!is_mmap() || recv_sys.rpo)
+  if (recv_sys.rpo && recv_sys.rpo < get_flushed_lsn())
     return;
 
+  latch.wr_unlock();
   log_resize_acquire();
   ut_ad(!resize_in_progress());
   ut_ad(get_lsn() == get_flushed_lsn(std::memory_order_relaxed));
 #ifdef HAVE_PMEM
-  if (is_opened() && !is_mmap_writeable())
+  if (is_mmap_writeable())
+  {
+    buf_size= unsigned(std::min<uint64_t>(capacity(), buf_size_max));
+    mprotect(buf, size_t(file_size), PROT_READ | PROT_WRITE);
+    ut_ad(next_checkpoint_no <= START_OFFSET / 4);
+    if (archive)
+      /* Clear any garbage that may have been left behind by a
+      crash during write_checkpoint() or set_archive(). */
+      memset_aligned<4>(buf + next_checkpoint_no * 4, 0,
+                        START_OFFSET - (next_checkpoint_no * 4));
+  }
+  else if (is_opened())
 #endif
   {
     ut_ad(write_lsn == get_lsn());
@@ -1817,7 +1833,9 @@ void log_t::clear_mmap() noexcept
       memcpy_aligned<16>(buf, log_block, bs);
     }
   }
-  log_resize_release();
+
+  write_lock.release(write_lock.value());
+  flush_lock.release(flush_lock.value());
 }
 
 /** Durably write the log up to log_sys.get_lsn(). */

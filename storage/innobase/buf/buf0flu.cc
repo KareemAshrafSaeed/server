@@ -1956,8 +1956,8 @@ inline void log_t::write_checkpoint(lsn_t end_lsn) noexcept
     goto wrote_checkpoint;
   }
 
-  static_assert(CHECKPOINT_1 * 2 == CHECKPOINT_2, "");
-  offset= CHECKPOINT_1 * (1 + (next_checkpoint_no & 1));
+  static_assert(CHECKPOINT_1 << 1 == CHECKPOINT_2, "");
+  offset= CHECKPOINT_1 << (next_checkpoint_no & 1);
   c= is_mmap() ? buf + offset : checkpoint_buf;
   memset_aligned<CPU_LEVEL1_DCACHE_LINESIZE>(c, 0,
                                              CPU_LEVEL1_DCACHE_LINESIZE);

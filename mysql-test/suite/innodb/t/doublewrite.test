@@ -21,7 +21,7 @@ call mtr.add_suppression("InnoDB: Inconsistent tablespace ID in .*t1\\.ibd");
 call mtr.add_suppression("\\[Warning\\] Found 1 prepared XA transactions");
 call mtr.add_suppression("InnoDB: Header page consists of zero bytes in datafile:");
 call mtr.add_suppression("InnoDB: Page \\[page id: space=[1-9][0-9]*, page number=3\\] log sequence number 18446744073709551615 is in the future!");
-call mtr.add_suppression("InnoDB: Your database may be corrupt or you may have copied the InnoDB tablespace but not the ib_logfile0");
+call mtr.add_suppression("InnoDB: Your database may be corrupt or you may have copied the InnoDB tablespaces but not the log");
 call mtr.add_suppression("InnoDB: Plugin initialization aborted");
 --enable_query_log
 

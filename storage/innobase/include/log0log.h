@@ -409,11 +409,20 @@ private:
   @param b       resize_buf or resize_flush_buf
   @param length  the used length of b */
   void resize_write_buf(const byte *b, size_t length) noexcept;
+
+  /** Rename a log file.
+  @param old_name  the old log file name
+  @return whether an error occurred */
+  ATTRIBUTE_COLD static bool rename(const std::string &old_name) noexcept;
 public:
 
   /** Rename a log file after resizing.
   @return whether an error occurred */
-  static bool resize_rename() noexcept;
+  ATTRIBUTE_COLD static bool resize_rename() noexcept;
+
+  /** During recovery, rename an archived log file to ib_logfile0.
+  @return whether an error occurred. */
+  ATTRIBUTE_COLD bool archive_rename() noexcept;
 
   /** Initialise the redo log subsystem. */
   void create() noexcept;

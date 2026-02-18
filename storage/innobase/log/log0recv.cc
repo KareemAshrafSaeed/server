@@ -1494,7 +1494,6 @@ void recv_sys_t::debug_free()
   tmp_free();
 
   mysql_mutex_unlock(&mutex);
-  log_sys.clear_mmap();
 }
 
 /** Free a redo log snippet.
@@ -1731,6 +1730,7 @@ dberr_t recv_sys_t::find_checkpoint()
   byte *buf;
   lsn_t first_lsn= 0;
   bool read_only{srv_read_only_mode || srv_operation >= SRV_OPERATION_BACKUP};
+  os_offset_t size= 0;
 
   ut_ad(pages.empty());
   ut_ad(log_archive.empty());
@@ -1817,8 +1817,9 @@ dberr_t recv_sys_t::find_checkpoint()
           sql_print_warning("InnoDB: ignoring %s", fn);
           continue;
         }
+        size= filesize.QuadPart;
         log_archive.emplace
-          (lsn, archive_log{lsn - log_t::START_OFFSET + filesize.QuadPart,
+          (lsn, archive_log{lsn - log_t::START_OFFSET + size,
                             log_t::log_access(entry.dwFileAttributes &
                                               FILE_ATTRIBUTE_READONLY)});
       }
@@ -1844,8 +1845,9 @@ dberr_t recv_sys_t::find_checkpoint()
           sql_print_warning("InnoDB: ignoring %s", path.c_str());
           continue;
         }
+        size= st.st_size;
         log_archive.emplace
-          (lsn, archive_log{lsn - log_t::START_OFFSET + st.st_size,
+          (lsn, archive_log{lsn - log_t::START_OFFSET + size,
                             log_t::log_access(!(st.st_mode & 0200))});
       }
       closedir(d);
@@ -1937,11 +1939,35 @@ dberr_t recv_sys_t::find_checkpoint()
               return DB_SUCCESS;
             log_sys.next_checkpoint_no= UINT16_MAX;
             if (const byte *checkpoint_buf= log_sys.checkpoint_buf)
-              memcpy(last_checkpoint_buf, checkpoint_buf, log_sys.write_size);
+            {
+              /* Clear any garbage that may have been left behind by a
+              crash during log_t::write_checkpoint() or
+              log_t::set_archive(). See also log_t::clear_mmap(). */
+              const size_t bs{log_sys.write_size};
+              memcpy(last_checkpoint_buf, checkpoint_buf, bs);
+              const size_t tail= (last_checkpoint_no * 4) & (bs - 1);
+              memset(last_checkpoint_buf + tail, 0, bs - tail);
+            }
             goto next;
           }
-          else
+
+          const byte *buf= log_sys.checkpoint_buf;
+          if (!buf)
+            buf= log_sys.buf;
+          switch (mach_read_from_4(my_assume_aligned<4>(buf))) {
+          case log_t::FORMAT_10_8:
+          case log_t::FORMAT_ENC_11:
+            if (recv_check_log_block(buf))
+            {
+              recv_sys.was_archive= true;
+              log_sys.archive= false;
+              file= OS_FILE_CLOSED;
+              goto circular_log_recovery;
+            }
+            /* fall through */
+          default:
             last_checkpoint_no= uint16_t(8 * log_sys.is_encrypted());
+          }
         }
         else if (err == DB_SUCCESS)
         {
@@ -1963,25 +1989,29 @@ dberr_t recv_sys_t::find_checkpoint()
     }
 
     ut_ad(!log_sys.archive);
-    const os_offset_t size{os_file_get_size(file)};
+    size= os_file_get_size(file);
     if (!size)
     {
       if (srv_operation != SRV_OPERATION_NORMAL)
         goto too_small;
     }
-    else if (size < log_t::START_OFFSET + SIZE_OF_FILE_CHECKPOINT)
-    {
-    too_small:
-      sql_print_error("InnoDB: File %s is too small", path.c_str());
-    err_exit:
-      os_file_close(file);
-      return DB_ERROR;
-    }
-    else if (!log_sys.attach(file, size, log_t::log_access(read_only)))
-      goto err_exit;
     else
-      file= OS_FILE_CLOSED;
+    {
+      if (size < log_t::START_OFFSET + SIZE_OF_FILE_CHECKPOINT)
+      {
+      too_small:
+        sql_print_error("InnoDB: File %s is too small", path.c_str());
+      err_exit:
+        os_file_close(file);
+        return DB_ERROR;
+      }
+      else if (!log_sys.attach(file, size, log_t::log_access(read_only)))
+        goto err_exit;
+      else
+        file= OS_FILE_CLOSED;
+    }
 
+  circular_log_recovery:
     files.emplace_back(file);
 
     for (int i= 1; i < 101; i++)
@@ -4756,11 +4786,6 @@ void recv_sys_t::apply(bool last_batch)
     in ascending order of buf_page_t::oldest_modification. */
     log_sort_flush_list();
 
-#ifdef HAVE_PMEM
-  if (last_batch && log_sys.is_mmap() && !log_sys.is_opened())
-    mprotect(log_sys.buf, len, PROT_READ | PROT_WRITE);
-#endif
-
   mysql_mutex_lock(&mutex);
 
   ut_d(after_apply= true);
@@ -5426,18 +5451,45 @@ inline void log_t::set_recovered() noexcept
   ut_ad(get_flushed_lsn() == get_lsn());
   ut_ad(recv_sys.lsn == get_flushed_lsn() ||
         (recv_sys.rpo && recv_sys.rpo < get_flushed_lsn()));
-  if (!is_mmap())
+  ut_ad(!resize_log.is_opened());
+  ut_ad(!resize_buf);
+  ut_ad(!resize_flush_buf);
+  if (is_mmap())
+    clear_mmap();
+  else if (const size_t offset= recv_sys.offset & ~size_t(write_size - 1))
+    memmove_aligned<512>(buf, buf + offset, write_size);
+}
+
+/** During recovery, rename an archived log file to ib_logfile0. */
+ATTRIBUTE_COLD bool log_t::archive_rename() noexcept
+{
+  ut_ad(!archive);
+  ut_ad(!srv_read_only_mode);
+  /* Only rename if we successfully applied all the log. */
+  bool success= recv_sys.rpo && recv_sys.rpo < get_flushed_lsn();
+  if (!success)
   {
-    const size_t bs{log_sys.write_size}, bs_1{bs - 1};
-    memmove_aligned<512>(buf, buf + (recv_sys.offset & ~bs_1), bs);
-  }
-#ifdef HAVE_PMEM
-  else
-  {
-    buf_size= unsigned(std::min<uint64_t>(capacity(), buf_size_max));
-    mprotect(buf, size_t(file_size), PROT_READ | PROT_WRITE);
-  }
+    {
+      const std::string old_name{get_archive_path(get_first_lsn())};
+      sql_print_warning("InnoDB: Renaming %.*s to ib_logfile0",
+                        int(old_name.size()), old_name.data());
+#ifdef _WIN32
+      /* On Windows, open files cannot be renamed. */
+      ut_ad(!is_mmap());
+      log.close();
 #endif
+      success= rename(old_name);
+    }
+#ifdef _WIN32
+    if (success)
+    {
+      log.m_file= os_file_create_func(get_path().c_str(), OS_FILE_OPEN,
+                                      OS_LOG_FILE, false, &success);
+      ut_ad(success == log.is_opened());
+    }
+#endif
+  }
+  return success;
 }
 
 inline bool recv_sys_t::validate_checkpoint() const noexcept
@@ -5487,7 +5539,7 @@ dberr_t recv_sys_t::find_checkpoint_archived(lsn_t first_lsn, bool silent)
     buf= log_sys.buf;
   uint16_t n_checkpoint= 0;
   {
-    const uint32_t format{mach_read_from_4(buf)};
+    const uint32_t format{mach_read_from_4(my_assume_aligned<4>(buf))};
     if (srv_encrypt_log ? format != 1 : format < log_t::START_OFFSET)
     {
       /* TODO: correct the file header later, if we can recover
@@ -5811,8 +5863,12 @@ err_exit:
 			goto func_exit;
 		}
 
-                if (!srv_read_only_mode) {
+		if (!srv_read_only_mode) {
 			log_sys.set_recovered();
+			if (UNIV_UNLIKELY(recv_sys.was_archive)
+			    && !log_sys.archive_rename()) {
+				goto err_exit;
+			}
 		}
 	}
 

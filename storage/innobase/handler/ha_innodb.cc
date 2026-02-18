@@ -4173,7 +4173,15 @@ static int innodb_init(void* p)
 	dberr_t	err = srv_sys_space.check_file_spec(&create_new_db, 5U << 20);
 
 	if (err != DB_SUCCESS) {
+	init_abort:
 		DBUG_RETURN(innodb_init_abort());
+	}
+
+	if (create_new_db && recv_sys.rpo) {
+		sql_print_error("InnoDB: Cannot fulfill"
+				" innodb_log_recovery_target"
+				" because no database exists!");
+		goto init_abort;
 	}
 
 	err = srv_start(create_new_db);
@@ -4183,7 +4191,7 @@ static int innodb_init(void* p)
 			recv_sys.rpo = srv_read_only_mode;
 		}
 		innodb_shutdown();
-		DBUG_RETURN(innodb_init_abort());
+		goto init_abort;
 	}
 
 	srv_was_started = true;

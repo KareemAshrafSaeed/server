@@ -229,7 +229,9 @@ public:
   Atomic_relaxed<bool> recovery_on= false;
   /** whether recv_recover_page(), invoked from buf_page_t::read_complete(),
   should apply log records*/
-  bool apply_log_recs;
+  bool apply_log_recs:1;
+  /** whether a circular log was recovered with archive file name */
+  bool was_archive:1;
   /** number of bytes in log_sys.buf */
   size_t len;
   /** start offset of non-parsed log records in log_sys.buf */
